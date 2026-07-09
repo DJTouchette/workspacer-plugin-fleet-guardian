@@ -1,19 +1,27 @@
 #!/usr/bin/env node
-// Generic workspacer plugin sidecar scaffold — zero dependencies.
-// Node >= 22 (global WebSocket) and >= 18 (global fetch). Reads its own
-// plugin.json for the bus topics it subscribes to and the capabilities it may
-// call, connects to the hub bus, logs events, and serves a tiny status pane.
-// Implement your logic in onEvent(). See README for events + capabilities.
+// Fleet Guardian — autonomy with brakes. Zero-dependency workspacer plugin
+// sidecar (Node >= 22: global WebSocket, fetch). It watches the fleet's live
+// usage and, without a human in the loop, applies two brakes:
+//
+//   1. Rate limit — if ANY account usage window (5h / 7d / monthly) crosses
+//      `rateLimitPct`, it SIGINTs the highest-cost active agent (pausing its
+//      current turn) and posts one warning. It re-arms once the fleet drops
+//      back under the threshold.
+//   2. Budget — if `budgetUSD > 0` and a session's costUSD reaches it, it
+//      switches that session to `downgradeModel` (once per session) and warns.
+//
+// It reacts to `agent.statusline` / `agent.snapshot` events for fast response
+// AND polls `agents.list` every ~20s (per-session cost is not a bus event, so
+// the poll is the authoritative cost source — see README).
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
 const DIR = __dirname;
 const manifest = JSON.parse(fs.readFileSync(path.join(DIR, 'plugin.json'), 'utf8'));
-const PORT = Number(process.env.PORT || (manifest.server && manifest.server.port) || 9200);
+const PORT = Number(process.env.PORT || (manifest.server && manifest.server.port) || 9202);
 
-// The hub injects the bus URL + this plugin's scoped token. Accept the common
-// conventions so the scaffold runs however your hub wires it.
+// The hub injects the bus URL + this plugin's scoped token.
 const BUS_URL = process.env.WKS_BUS_URL || 'ws://127.0.0.1:7895/bus';
 function readToken() {
   if (process.env.WKS_BUS_TOKEN) return process.env.WKS_BUS_TOKEN;
@@ -23,10 +31,28 @@ function readToken() {
 let settings = {};
 try { settings = JSON.parse(process.env.WKS_SETTINGS || '{}'); } catch {}
 
+function numOr(v, dflt) { const n = Number(v); return Number.isFinite(n) ? n : dflt; }
+const RATE_PCT = numOr(settings.rateLimitPct, 90);
+const BUDGET_USD = numOr(settings.budgetUSD, 0);
+const DOWNGRADE_MODEL =
+  (typeof settings.downgradeModel === 'string' && settings.downgradeModel.trim()) || 'claude-haiku-4-5';
+const POLL_MS = 20000;
+// Signal used to "pause" an agent: interrupt the current turn (not kill it).
+const PAUSE_SIGNAL = 'SIGINT';
+// States in which an agent is actively spending tokens (worth pausing).
+const ACTIVE_STATES = new Set(['thinking', 'streaming', 'responding', 'working']);
+
 const TOPICS = manifest.consumes || [];
 const recent = [];
 let ws = null, connected = false, callSeq = 0;
 const pending = new Map();
+
+// ── Guard state ───────────────────────────────────────────────────────────────
+// sessionId -> { cwd, model, state, costUSD, windows:{fiveHour,sevenDay,monthly} }
+const sessions = new Map();
+const downgraded = new Set();        // budget guard: sessions already downgraded
+const pausedForRateLimit = new Set(); // sessions SIGINT'd during the current trip
+let rateLimitTripped = false;        // rate-limit guard armed? (re-arms under threshold)
 
 function log(msg) {
   console.log('[' + manifest.id + '] ' + msg);
@@ -49,13 +75,214 @@ function publish(type, data) {
   if (connected) ws.send(JSON.stringify({ op: 'publish', event: { type, source: manifest.id, data: data || {} } }));
 }
 
+async function notify(title, body) {
+  try { await call('notifications.post', { title, body }); }
+  catch (e) { log('notify failed: ' + e.message); }
+}
+
+// ── Normalization (tolerate camelCase snapshot + snake_case statusline) ─────────
+function num(v) { return typeof v === 'number' && Number.isFinite(v) ? v : undefined; }
+function short(id) { return String(id || '').slice(0, 8); }
+
+function sessionFor(id) {
+  let s = sessions.get(id);
+  if (!s) { s = { cwd: undefined, model: undefined, state: undefined, costUSD: undefined, windows: {} }; sessions.set(id, s); }
+  if (!s.windows) s.windows = {};
+  return s;
+}
+
+// Merge a status-line object (either camelCase SessionStatusLine or the raw
+// snake_case claudemon StatusLine) into a session.
+function applyStatusLine(s, sl) {
+  if (!sl || typeof sl !== 'object') return;
+  const w = s.windows;
+  const five = num(sl.fiveHourPct != null ? sl.fiveHourPct : sl.five_hour_pct);
+  const seven = num(sl.sevenDayPct != null ? sl.sevenDayPct : sl.seven_day_pct);
+  const monthly = num(sl.monthlyPct != null ? sl.monthlyPct : sl.monthly_pct);
+  if (five !== undefined) w.fiveHour = five;
+  if (seven !== undefined) w.sevenDay = seven;
+  if (monthly !== undefined) w.monthly = monthly;
+  const cost = num(sl.costUSD != null ? sl.costUSD : sl.cost_usd);
+  if (cost !== undefined) s.costUSD = cost;
+  if (sl.model_display && !s.model) s.model = sl.model_display;
+  if (sl.modelDisplay && !s.model) s.model = sl.modelDisplay;
+}
+
+function isActive(s) {
+  return !!s && ACTIVE_STATES.has(String(s.state || '').toLowerCase());
+}
+
+// Highest utilization across every known session's usage windows. Windows are
+// account-wide, so any session's window reflects the shared limit.
+function fleetPeakUtilization() {
+  let max = -1, which = null;
+  for (const [id, s] of sessions) {
+    const w = s.windows || {};
+    for (const key of [['fiveHour', '5h'], ['sevenDay', '7d'], ['monthly', 'monthly']]) {
+      const v = w[key[0]];
+      if (typeof v === 'number' && v > max) { max = v; which = { sessionId: id, window: key[1], pct: v }; }
+    }
+  }
+  return { max, which };
+}
+
+// ── The two guards (serialized so a statusline flood can't double-fire) ─────────
+let evaluating = false, evalQueued = false, evalTimer = null;
+
+function scheduleEvaluate() {
+  if (evalTimer) return;
+  evalTimer = setTimeout(() => {
+    evalTimer = null;
+    evaluate().catch((e) => log('evaluate error: ' + e.message));
+  }, 300);
+}
+
+async function evaluate() {
+  if (evaluating) { evalQueued = true; return; }
+  evaluating = true;
+  try {
+    do {
+      evalQueued = false;
+      await evalRateLimit();
+      await evalBudget();
+    } while (evalQueued);
+  } finally { evaluating = false; }
+}
+
+async function evalRateLimit() {
+  const { max, which } = fleetPeakUtilization();
+  if (max < 0) return; // no window data yet
+  if (max >= RATE_PCT) {
+    if (rateLimitTripped) return; // already braked this episode
+    rateLimitTripped = true;
+    const active = [...sessions.entries()]
+      .filter(([, s]) => isActive(s))
+      .sort((a, b) => (b[1].costUSD || 0) - (a[1].costUSD || 0));
+    if (active.length === 0) {
+      log(`rate limit ${which.window} at ${max.toFixed(0)}% (>=${RATE_PCT}%) — no active agents to pause`);
+      await notify(
+        'Rate limit approaching',
+        `Account ${which.window} window at ${max.toFixed(0)}% (≥${RATE_PCT}%). No active agents to pause.`,
+      );
+      return;
+    }
+    const [topId, top] = active[0];
+    try {
+      await call('claude.signal', { sessionId: topId, signal: PAUSE_SIGNAL });
+      pausedForRateLimit.add(topId);
+      log(`rate limit ${which.window} at ${max.toFixed(0)}% — paused highest-cost agent ${short(topId)} ($${(top.costUSD || 0).toFixed(2)})`);
+    } catch (e) {
+      // Let it re-try next episode by leaving the flag set only on success.
+      rateLimitTripped = false;
+      log('claude.signal failed: ' + e.message);
+      return;
+    }
+    await notify(
+      'Rate limit — agent paused',
+      `Account ${which.window} window at ${max.toFixed(0)}% (≥${RATE_PCT}%). Interrupted highest-cost active agent ` +
+        `${short(topId)} (${top.cwd || '?'}, $${(top.costUSD || 0).toFixed(2)})` +
+        (active.length > 1 ? ` — ${active.length - 1} other active agent(s) left running.` : '.'),
+    );
+  } else if (rateLimitTripped) {
+    // Dropped back under threshold — re-arm so the brake can fire again later.
+    rateLimitTripped = false;
+    pausedForRateLimit.clear();
+    log(`rate limit recovered (peak ${max.toFixed(0)}% < ${RATE_PCT}%) — guard re-armed`);
+  }
+}
+
+async function evalBudget() {
+  if (BUDGET_USD <= 0) return;
+  for (const [id, s] of sessions) {
+    if (downgraded.has(id)) continue;
+    const cost = s.costUSD;
+    if (typeof cost !== 'number' || cost < BUDGET_USD) continue;
+    if (s.model && s.model === DOWNGRADE_MODEL) { downgraded.add(id); continue; } // already cheap
+    downgraded.add(id); // reserve first so a statusline flood can't double-fire
+    try {
+      await call('claude.setModel', { sessionId: id, model: DOWNGRADE_MODEL });
+      log(`budget: ${short(id)} hit $${cost.toFixed(2)} (>=$${BUDGET_USD}) — downgraded to ${DOWNGRADE_MODEL}`);
+    } catch (e) {
+      downgraded.delete(id); // failed — allow a retry next cycle
+      log(`claude.setModel failed for ${short(id)}: ${e.message}`);
+      continue;
+    }
+    await notify(
+      'Budget reached — model downgraded',
+      `${short(id)} (${s.cwd || '?'}) reached $${cost.toFixed(2)} (≥$${BUDGET_USD}). Switched to ${DOWNGRADE_MODEL}.`,
+    );
+  }
+}
+
+// ── Poll loop: authoritative per-session cost + roster ──────────────────────────
+async function poll() {
+  if (!connected) return;
+  let list;
+  try { list = await call('agents.list', {}); }
+  catch (e) { log('agents.list failed: ' + e.message); return; }
+  if (!Array.isArray(list)) return;
+  const seen = new Set();
+  for (const a of list) {
+    if (!a || !a.sessionId) continue;
+    seen.add(a.sessionId);
+    const s = sessionFor(a.sessionId);
+    if (a.cwd != null) s.cwd = a.cwd;
+    if (a.model != null) s.model = a.model;
+    if (a.state != null) s.state = a.state;
+    const cost = num(a.costUSD);
+    if (cost !== undefined) s.costUSD = cost;
+  }
+  // Prune sessions no longer in the roster — they can't spend and shouldn't
+  // hold the account-window peak open (a gone session's stale window would
+  // block re-arm forever).
+  for (const id of [...sessions.keys()]) {
+    if (!seen.has(id)) { sessions.delete(id); downgraded.delete(id); pausedForRateLimit.delete(id); }
+  }
+  scheduleEvaluate();
+}
+
+// ── Bus wiring ─────────────────────────────────────────────────────────────────
+async function onEvent(event) {
+  const type = event && event.type;
+  const data = event && event.data;
+  if (!data || typeof data !== 'object') return;
+
+  if (type === 'agent.statusline') {
+    const id = data.sessionId || data.session_id;
+    if (!id) return;
+    const sl = data.statusLine || data.status_line || data;
+    applyStatusLine(sessionFor(id), sl);
+    scheduleEvaluate();
+    return;
+  }
+
+  if (type === 'agent.snapshot') {
+    const id = data.sessionId || data.session_id;
+    if (!id) return;
+    const s = sessionFor(id);
+    if (data.cwd != null) s.cwd = data.cwd;
+    if (data.ambientState != null) s.state = data.ambientState;
+    const sl = data.statusLine || data.status_line;
+    if (sl) applyStatusLine(s, sl);
+    // usage.costUSD is the transcript-derived cost; use it if the status line
+    // didn't carry one.
+    if (s.costUSD === undefined && data.usage) {
+      const uc = num(data.usage.costUSD != null ? data.usage.costUSD : data.usage.cost_usd);
+      if (uc !== undefined) s.costUSD = uc;
+    }
+    scheduleEvaluate();
+  }
+}
+
 function connect() {
   const tok = readToken();
   ws = new WebSocket(BUS_URL + (tok ? '?token=' + encodeURIComponent(tok) : ''));
   ws.addEventListener('open', () => {
     connected = true;
     if (TOPICS.length) ws.send(JSON.stringify({ op: 'subscribe', topics: TOPICS }));
-    log('connected; subscribed to ' + (TOPICS.join(', ') || '(nothing)'));
+    log('connected; subscribed to ' + (TOPICS.join(', ') || '(nothing)') +
+      `; rateLimitPct=${RATE_PCT} budgetUSD=${BUDGET_USD} downgradeModel=${DOWNGRADE_MODEL}`);
+    poll().catch((e) => log('poll error: ' + e.message)); // snapshot the roster right away
   });
   ws.addEventListener('message', (ev) => {
     let f; try { f = JSON.parse(ev.data); } catch { return; }
@@ -67,27 +294,36 @@ function connect() {
   ws.addEventListener('error', () => { try { ws.close(); } catch {} });
 }
 
-// ── Your plugin logic ─────────────────────────────────────────────────────────
-async function onEvent(event) {
-  log('event ' + event.type);
-  // TODO: react to `event`. Use call('cap.method', {...}) for capabilities,
-  // publish('command.x', {...}) for commands, or fetch(...) to reach outside.
-}
+// Poll on a timer regardless of event traffic (cost isn't event-driven).
+setInterval(() => { poll().catch((e) => log('poll error: ' + e.message)); }, POLL_MS);
 
 const server = http.createServer((req, res) => {
   if (req.url === '/health') { res.writeHead(200); return res.end('ok'); }
+  const peak = fleetPeakUtilization();
+  const rows = [...sessions.entries()].map(([id, s]) => {
+    const w = s.windows || {};
+    const win = ['fiveHour', 'sevenDay', 'monthly']
+      .map((k) => (typeof w[k] === 'number' ? `${k === 'fiveHour' ? '5h' : k === 'sevenDay' ? '7d' : 'mo'} ${w[k].toFixed(0)}%` : null))
+      .filter(Boolean).join(' ') || '—';
+    const flags = [downgraded.has(id) ? 'downgraded' : null, pausedForRateLimit.has(id) ? 'paused' : null]
+      .filter(Boolean).join(',');
+    return `${short(id)}  ${s.state || '?'}  $${(s.costUSD || 0).toFixed(2)}  ${win}  ${flags}`;
+  });
   res.writeHead(200, { 'Content-Type': 'text/html' });
   res.end('<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=2>'
     + '<title>' + manifest.name + '</title><body style="font-family:system-ui;'
     + 'background:var(--wks-bg-base,#161616);color:var(--wks-text-primary,#e8e8e8);margin:0;padding:14px">'
-    + '<h2 style="font-size:1rem">' + manifest.name + '</h2>'
+    + '<h2 style="font-size:1rem">🛡 ' + manifest.name + '</h2>'
     + '<p style="color:var(--wks-text-muted,#888);font-size:.8rem">'
-    + (connected ? '\u{1F7E2} connected to hub' : '\u{1F534} disconnected')
-    + ' · subscribed to ' + (TOPICS.join(', ') || '(nothing)') + '</p>'
-    + '<pre style="font-size:.7rem;color:var(--wks-text-faint,#777);white-space:pre-wrap">'
-    + (recent.map(escapeHtml).join('\n') || 'waiting for events…') + '</pre>'
-    + '<p style="color:var(--wks-text-faint,#777);font-size:.7rem">Scaffold — edit '
-    + '<code>server.js</code> (onEvent) to implement.</p>');
+    + (connected ? '\u{1F7E2} connected' : '\u{1F534} disconnected')
+    + ` · pause ≥${RATE_PCT}% · budget ` + (BUDGET_USD > 0 ? `$${BUDGET_USD}→${DOWNGRADE_MODEL}` : 'off')
+    + ` · peak usage ${peak.max >= 0 ? peak.max.toFixed(0) + '%' : '—'}`
+    + (rateLimitTripped ? ' · ⚠ rate-limit brake engaged' : '') + '</p>'
+    + '<pre style="font-size:.72rem;color:var(--wks-text-faint,#aaa);white-space:pre-wrap">'
+    + (escapeHtml(rows.join('\n')) || 'no agents yet…') + '</pre>'
+    + '<h3 style="font-size:.8rem;color:var(--wks-text-muted,#888)">recent</h3>'
+    + '<pre style="font-size:.68rem;color:var(--wks-text-faint,#777);white-space:pre-wrap">'
+    + (recent.map(escapeHtml).join('\n') || 'waiting for events…') + '</pre>');
 });
 function escapeHtml(s) { return String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
 server.listen(PORT, '127.0.0.1', () => log('pane on http://127.0.0.1:' + PORT));
