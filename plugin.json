@@ -1,0 +1,55 @@
+{
+  "id": "djtouchette.fleet-guardian",
+  "name": "Fleet Guardian",
+  "apiVersion": "1",
+  "server": {
+    "command": "node",
+    "args": [
+      "server.js"
+    ],
+    "port": 9202,
+    "health": "/health"
+  },
+  "panes": [
+    {
+      "type": "djtouchette.fleet-guardian",
+      "title": "Fleet Guardian",
+      "icon": "\ud83d\udee1",
+      "scope": "global",
+      "path": "/"
+    }
+  ],
+  "settings": [
+    {
+      "key": "rateLimitPct",
+      "label": "Rate-limit pause threshold (%)",
+      "type": "number",
+      "default": 90,
+      "help": "Pause spendy agents when a window crosses this utilization."
+    },
+    {
+      "key": "budgetUSD",
+      "label": "Per-session budget (USD)",
+      "type": "number",
+      "default": 0,
+      "help": "0 = off. Downgrade a session's model past this spend."
+    },
+    {
+      "key": "downgradeModel",
+      "label": "Downgrade model",
+      "type": "string",
+      "default": "claude-haiku-4-5",
+      "help": "Model to switch to on budget overrun."
+    }
+  ],
+  "capabilities": [
+    "agents.list",
+    "claude.signal",
+    "claude.setModel",
+    "notifications.post"
+  ],
+  "consumes": [
+    "agent.snapshot",
+    "agent.statusline"
+  ]
+}
