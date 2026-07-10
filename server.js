@@ -52,7 +52,8 @@ const pending = new Map();
 const sessions = new Map();
 const downgraded = new Set();        // budget guard: sessions already downgraded
 const pausedForRateLimit = new Set(); // sessions SIGINT'd during the current trip
-let rateLimitTripped = false;        // rate-limit guard armed? (re-arms under threshold)
+let rateLimitTripped = false;        // brake fired this episode (only after a successful pause)
+let noActiveNotified = false;        // "over threshold but nothing to pause" notified this episode
 
 function log(msg) {
   console.log('[' + manifest.id + '] ' + msg);
@@ -154,11 +155,38 @@ async function evalRateLimit() {
   if (max < 0) return; // no window data yet
   if (max >= RATE_PCT) {
     if (rateLimitTripped) return; // already braked this episode
-    rateLimitTripped = true;
-    const active = [...sessions.entries()]
+    let active = [...sessions.entries()]
       .filter(([, s]) => isActive(s))
       .sort((a, b) => (b[1].costUSD || 0) - (a[1].costUSD || 0));
     if (active.length === 0) {
+      // The roster may simply not be loaded yet (e.g. a statusline arrived
+      // before the first successful agents.list — provider briefly absent).
+      // Refresh it inline and re-check before concluding there's nothing to
+      // pause; otherwise stay UN-tripped so the brake still fires as soon as
+      // the roster shows an active agent, and notify only once per episode.
+      try {
+        const list = await call('agents.list', {});
+        if (Array.isArray(list)) {
+          for (const a of list) {
+            if (!a || !a.sessionId) continue;
+            const s = sessionFor(a.sessionId);
+            if (a.cwd != null) s.cwd = a.cwd;
+            if (a.model != null) s.model = a.model;
+            if (a.state != null) s.state = a.state;
+            const cost = num(a.costUSD);
+            if (cost !== undefined) s.costUSD = cost;
+          }
+        }
+      } catch (e) {
+        log('agents.list refresh failed: ' + e.message);
+      }
+      active = [...sessions.entries()]
+        .filter(([, s]) => isActive(s))
+        .sort((a, b) => (b[1].costUSD || 0) - (a[1].costUSD || 0));
+    }
+    if (active.length === 0) {
+      if (noActiveNotified) return; // stay re-armable; already warned this episode
+      noActiveNotified = true;
       log(`rate limit ${which.window} at ${max.toFixed(0)}% (>=${RATE_PCT}%) — no active agents to pause`);
       await notify(
         'Rate limit approaching',
@@ -169,11 +197,11 @@ async function evalRateLimit() {
     const [topId, top] = active[0];
     try {
       await call('claude.signal', { sessionId: topId, signal: PAUSE_SIGNAL });
+      rateLimitTripped = true;
       pausedForRateLimit.add(topId);
       log(`rate limit ${which.window} at ${max.toFixed(0)}% — paused highest-cost agent ${short(topId)} ($${(top.costUSD || 0).toFixed(2)})`);
     } catch (e) {
-      // Let it re-try next episode by leaving the flag set only on success.
-      rateLimitTripped = false;
+      // Leave the flag unset so the next cycle retries the pause.
       log('claude.signal failed: ' + e.message);
       return;
     }
@@ -183,9 +211,10 @@ async function evalRateLimit() {
         `${short(topId)} (${top.cwd || '?'}, $${(top.costUSD || 0).toFixed(2)})` +
         (active.length > 1 ? ` — ${active.length - 1} other active agent(s) left running.` : '.'),
     );
-  } else if (rateLimitTripped) {
+  } else if (rateLimitTripped || noActiveNotified) {
     // Dropped back under threshold — re-arm so the brake can fire again later.
     rateLimitTripped = false;
+    noActiveNotified = false;
     pausedForRateLimit.clear();
     log(`rate limit recovered (peak ${max.toFixed(0)}% < ${RATE_PCT}%) — guard re-armed`);
   }
