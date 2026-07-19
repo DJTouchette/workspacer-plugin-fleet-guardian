@@ -16,20 +16,17 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { connect } = require('./wks.js');
 
 const DIR = __dirname;
 const manifest = JSON.parse(fs.readFileSync(path.join(DIR, 'plugin.json'), 'utf8'));
 const PORT = Number(process.env.PORT || (manifest.server && manifest.server.port) || 9202);
 
-// The hub injects the bus URL + this plugin's scoped token.
-const BUS_URL = process.env.WKS_BUS_URL || 'ws://127.0.0.1:7895/bus';
-function readToken() {
-  if (process.env.WKS_BUS_TOKEN) return process.env.WKS_BUS_TOKEN;
-  try { return fs.readFileSync(path.join(DIR, '.bus-token'), 'utf8').trim(); } catch { return ''; }
-}
-// Host-injected settings (from manifest `settings`), passed as JSON in env.
-let settings = {};
-try { settings = JSON.parse(process.env.WKS_SETTINGS || '{}'); } catch {}
+// Connect to the hub bus via the vendored plugin SDK (wks.js). It reads the
+// scoped token (HUB_TOKEN / WKS_BUS_TOKEN / .bus-token), subscribes, delivers
+// events, and reconnects if the hub goes away. Settings come from the SDK too.
+const wks = connect({ source: manifest.id });
+const settings = wks.settings;
 
 function numOr(v, dflt) { const n = Number(v); return Number.isFinite(n) ? n : dflt; }
 const RATE_PCT = numOr(settings.rateLimitPct, 90);
@@ -44,8 +41,6 @@ const ACTIVE_STATES = new Set(['thinking', 'streaming', 'responding', 'working']
 
 const TOPICS = manifest.consumes || [];
 const recent = [];
-let ws = null, connected = false, callSeq = 0;
-const pending = new Map();
 
 // ── Guard state ───────────────────────────────────────────────────────────────
 // sessionId -> { cwd, model, state, costUSD, windows:{fiveHour,sevenDay,monthly} }
@@ -61,23 +56,18 @@ function log(msg) {
   if (recent.length > 100) recent.pop();
 }
 
-// Call a hub capability (must be declared in plugin.json `capabilities`).
-function call(method, params) {
-  return new Promise((resolve, reject) => {
-    if (!connected) return reject(new Error('not connected'));
-    const id = 'c' + (++callSeq);
-    pending.set(id, { resolve, reject });
-    ws.send(JSON.stringify({ op: 'call', id, method, params: params || {} }));
-    setTimeout(() => { if (pending.has(id)) { pending.delete(id); reject(new Error('timeout')); } }, 8000);
-  });
-}
-// Publish an event/command (must be declared in `emits`).
-function publish(type, data) {
-  if (connected) ws.send(JSON.stringify({ op: 'publish', event: { type, source: manifest.id, data: data || {} } }));
-}
+// Route each consumed topic to onEvent (the SDK subscribes to '*' internally).
+for (const t of TOPICS) wks.on(t, (data, event) => onEvent(event).catch((e) => log('onEvent error: ' + e.message)));
+// On each (re)connect, log config and snapshot the roster right away.
+wks.onStatus((c) => {
+  if (!c) return;
+  log('connected; subscribed to ' + (TOPICS.join(', ') || '(nothing)') +
+    `; rateLimitPct=${RATE_PCT} budgetUSD=${BUDGET_USD} downgradeModel=${DOWNGRADE_MODEL}`);
+  poll().catch((e) => log('poll error: ' + e.message)); // snapshot the roster right away
+});
 
 async function notify(title, body) {
-  try { await call('notifications.post', { title, body }); }
+  try { await wks.call('notifications.post', { title, body }); }
   catch (e) { log('notify failed: ' + e.message); }
 }
 
@@ -165,7 +155,7 @@ async function evalRateLimit() {
       // pause; otherwise stay UN-tripped so the brake still fires as soon as
       // the roster shows an active agent, and notify only once per episode.
       try {
-        const list = await call('agents.list', {});
+        const list = await wks.call('agents.list', {});
         if (Array.isArray(list)) {
           for (const a of list) {
             if (!a || !a.sessionId) continue;
@@ -196,7 +186,7 @@ async function evalRateLimit() {
     }
     const [topId, top] = active[0];
     try {
-      await call('claude.signal', { sessionId: topId, signal: PAUSE_SIGNAL });
+      await wks.call('claude.signal', { sessionId: topId, signal: PAUSE_SIGNAL });
       rateLimitTripped = true;
       pausedForRateLimit.add(topId);
       log(`rate limit ${which.window} at ${max.toFixed(0)}% — paused highest-cost agent ${short(topId)} ($${(top.costUSD || 0).toFixed(2)})`);
@@ -229,7 +219,7 @@ async function evalBudget() {
     if (s.model && s.model === DOWNGRADE_MODEL) { downgraded.add(id); continue; } // already cheap
     downgraded.add(id); // reserve first so a statusline flood can't double-fire
     try {
-      await call('claude.setModel', { sessionId: id, model: DOWNGRADE_MODEL });
+      await wks.call('claude.setModel', { sessionId: id, model: DOWNGRADE_MODEL });
       log(`budget: ${short(id)} hit $${cost.toFixed(2)} (>=$${BUDGET_USD}) — downgraded to ${DOWNGRADE_MODEL}`);
     } catch (e) {
       downgraded.delete(id); // failed — allow a retry next cycle
@@ -245,9 +235,9 @@ async function evalBudget() {
 
 // ── Poll loop: authoritative per-session cost + roster ──────────────────────────
 async function poll() {
-  if (!connected) return;
+  if (!wks.connected) return;
   let list;
-  try { list = await call('agents.list', {}); }
+  try { list = await wks.call('agents.list', {}); }
   catch (e) { log('agents.list failed: ' + e.message); return; }
   if (!Array.isArray(list)) return;
   const seen = new Set();
@@ -303,26 +293,6 @@ async function onEvent(event) {
   }
 }
 
-function connect() {
-  const tok = readToken();
-  ws = new WebSocket(BUS_URL + (tok ? '?token=' + encodeURIComponent(tok) : ''));
-  ws.addEventListener('open', () => {
-    connected = true;
-    if (TOPICS.length) ws.send(JSON.stringify({ op: 'subscribe', topics: TOPICS }));
-    log('connected; subscribed to ' + (TOPICS.join(', ') || '(nothing)') +
-      `; rateLimitPct=${RATE_PCT} budgetUSD=${BUDGET_USD} downgradeModel=${DOWNGRADE_MODEL}`);
-    poll().catch((e) => log('poll error: ' + e.message)); // snapshot the roster right away
-  });
-  ws.addEventListener('message', (ev) => {
-    let f; try { f = JSON.parse(ev.data); } catch { return; }
-    if (f.op === 'event' && f.event) onEvent(f.event).catch((e) => log('onEvent error: ' + e.message));
-    else if (f.op === 'result' && pending.has(f.id)) { pending.get(f.id).resolve(f.result); pending.delete(f.id); }
-    else if (f.op === 'error' && pending.has(f.id)) { pending.get(f.id).reject(new Error(f.error)); pending.delete(f.id); }
-  });
-  ws.addEventListener('close', () => { connected = false; setTimeout(connect, 1500); });
-  ws.addEventListener('error', () => { try { ws.close(); } catch {} });
-}
-
 // Poll on a timer regardless of event traffic (cost isn't event-driven).
 setInterval(() => { poll().catch((e) => log('poll error: ' + e.message)); }, POLL_MS);
 
@@ -344,7 +314,7 @@ const server = http.createServer((req, res) => {
     + 'background:var(--wks-bg-base,#161616);color:var(--wks-text-primary,#e8e8e8);margin:0;padding:14px">'
     + '<h2 style="font-size:1rem">🛡 ' + manifest.name + '</h2>'
     + '<p style="color:var(--wks-text-muted,#888);font-size:.8rem">'
-    + (connected ? '\u{1F7E2} connected' : '\u{1F534} disconnected')
+    + (wks.connected ? '\u{1F7E2} connected' : '\u{1F534} disconnected')
     + ` · pause ≥${RATE_PCT}% · budget ` + (BUDGET_USD > 0 ? `$${BUDGET_USD}→${DOWNGRADE_MODEL}` : 'off')
     + ` · peak usage ${peak.max >= 0 ? peak.max.toFixed(0) + '%' : '—'}`
     + (rateLimitTripped ? ' · ⚠ rate-limit brake engaged' : '') + '</p>'
@@ -356,4 +326,3 @@ const server = http.createServer((req, res) => {
 });
 function escapeHtml(s) { return String(s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
 server.listen(PORT, '127.0.0.1', () => log('pane on http://127.0.0.1:' + PORT));
-connect();
