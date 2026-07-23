@@ -66,8 +66,12 @@ wks.onStatus((c) => {
   poll().catch((e) => log('poll error: ' + e.message)); // snapshot the roster right away
 });
 
-async function notify(title, body) {
-  try { await wks.call('notifications.post', { title, body }); }
+// Post to the in-app notification center (+ OS toast unless the user disabled
+// it). Callers pass level/sessionId/key so enforcement actions are clickable
+// (jump to the affected agent) and a repeated condition replaces its own slot
+// instead of stacking.
+async function notify(fields) {
+  try { await wks.call('notifications.post', { source: 'plugin:' + manifest.id, ...fields }); }
   catch (e) { log('notify failed: ' + e.message); }
 }
 
@@ -178,10 +182,12 @@ async function evalRateLimit() {
       if (noActiveNotified) return; // stay re-armable; already warned this episode
       noActiveNotified = true;
       log(`rate limit ${which.window} at ${max.toFixed(0)}% (>=${RATE_PCT}%) — no active agents to pause`);
-      await notify(
-        'Rate limit approaching',
-        `Account ${which.window} window at ${max.toFixed(0)}% (≥${RATE_PCT}%). No active agents to pause.`,
-      );
+      await notify({
+        title: 'Rate limit approaching',
+        body: `Account ${which.window} window at ${max.toFixed(0)}% (≥${RATE_PCT}%). No active agents to pause.`,
+        level: 'warn',
+        key: 'fleet-guardian:rate-limit',
+      });
       return;
     }
     const [topId, top] = active[0];
@@ -195,14 +201,38 @@ async function evalRateLimit() {
       log('claude.signal failed: ' + e.message);
       return;
     }
-    await notify(
-      'Rate limit — agent paused',
-      `Account ${which.window} window at ${max.toFixed(0)}% (≥${RATE_PCT}%). Interrupted highest-cost active agent ` +
+    await notify({
+      title: 'Rate limit — agent paused',
+      body:
+        `Account ${which.window} window at ${max.toFixed(0)}% (≥${RATE_PCT}%). Interrupted highest-cost active agent ` +
         `${short(topId)} (${top.cwd || '?'}, $${(top.costUSD || 0).toFixed(2)})` +
         (active.length > 1 ? ` — ${active.length - 1} other active agent(s) left running.` : '.'),
-    );
+      level: 'warn',
+      sessionId: topId,
+      key: 'fleet-guardian:pause:' + topId,
+    });
   } else if (rateLimitTripped || noActiveNotified) {
     // Dropped back under threshold — re-arm so the brake can fire again later.
+    // Replace each pause warning (same key) with an all-clear so the center
+    // shows the current truth, not a stale alarm.
+    const recovered = `Peak window utilization back to ${max.toFixed(0)}% (<${RATE_PCT}%).`;
+    for (const id of pausedForRateLimit) {
+      await notify({
+        title: 'Rate limit recovered',
+        body: recovered + ` Paused agent ${short(id)} can be resumed.`,
+        level: 'info',
+        sessionId: id,
+        key: 'fleet-guardian:pause:' + id,
+      });
+    }
+    if (noActiveNotified && pausedForRateLimit.size === 0) {
+      await notify({
+        title: 'Rate limit recovered',
+        body: recovered,
+        level: 'info',
+        key: 'fleet-guardian:rate-limit',
+      });
+    }
     rateLimitTripped = false;
     noActiveNotified = false;
     pausedForRateLimit.clear();
@@ -226,10 +256,13 @@ async function evalBudget() {
       log(`claude.setModel failed for ${short(id)}: ${e.message}`);
       continue;
     }
-    await notify(
-      'Budget reached — model downgraded',
-      `${short(id)} (${s.cwd || '?'}) reached $${cost.toFixed(2)} (≥$${BUDGET_USD}). Switched to ${DOWNGRADE_MODEL}.`,
-    );
+    await notify({
+      title: 'Budget reached — model downgraded',
+      body: `${short(id)} (${s.cwd || '?'}) reached $${cost.toFixed(2)} (≥$${BUDGET_USD}). Switched to ${DOWNGRADE_MODEL}.`,
+      level: 'warn',
+      sessionId: id,
+      key: 'fleet-guardian:budget:' + id,
+    });
   }
 }
 
